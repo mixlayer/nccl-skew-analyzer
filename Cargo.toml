@@ -1,0 +1,9 @@
+[package]
+name = "nccl-skew-analyzer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+rusqlite = { version = "0.31", features = ["bundled"] }
+itertools = "0.12"
