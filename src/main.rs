@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
+use clap::Parser;
 use itertools::Itertools;
 use rusqlite::{Connection, OpenFlags};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 struct KernelEvent {
@@ -13,22 +14,32 @@ struct KernelEvent {
     demangled_name: String,
 }
 
-fn main() -> Result<()> {
-    let db_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "trace0.sqlite".to_string());
+#[derive(clap::Parser, Debug, Clone)]
+struct Args {
+    /// The path to the sqlite database file.
+    db_path: PathBuf,
 
-    let conn = open_connection(&db_path)?;
+    /// The reporting threshold for skew in microseconds.
+    #[clap(long, default_value = "500")]
+    threshold: i64,
+}
+
+fn main() -> Result<()> {
+    let args = Args::try_parse()?;
+
+    let conn = open_connection(&args.db_path)?;
 
     let rank_labels = load_rank_labels(&conn);
     let kernels = load_nccl_kernels(&conn)?;
 
     if kernels.is_empty() {
-        println!("No NCCL kernels found in {db_path}");
+        println!("No NCCL kernels found in {}", args.db_path.display());
         return Ok(());
     }
 
-    let ranks: Vec<i64> = BTreeSet::from_iter(kernels.iter().map(|k| k.global_pid)).into_iter().collect();
+    let ranks: Vec<i64> = BTreeSet::from_iter(kernels.iter().map(|k| k.global_pid))
+        .into_iter()
+        .collect();
 
     let rank_summary = ranks
         .iter()
@@ -64,14 +75,23 @@ fn main() -> Result<()> {
             .map(|v| v.len())
             .min()
             .unwrap_or(0);
+
         if min_len == 0 {
             continue;
         }
 
         printed_any = true;
         println!("\n{name}:");
+
+        let mut total_launches = 0;
+        let mut slow_launches = 0;
+        let mut total_skew = 0;
+        let mut total_slow_skew = 0;
+
         for idx in 0..min_len {
+            total_launches += 1;
             let mut times = Vec::new();
+
             for r in &ranks {
                 if let Some(events) = per_rank.get(r) {
                     if let Some(evt) = events.get(idx) {
@@ -82,26 +102,46 @@ fn main() -> Result<()> {
 
             let min_t = times.iter().map(|(_, t, _, _)| *t).min().unwrap();
             let max_t = times.iter().map(|(_, t, _, _)| *t).max().unwrap();
+
             let skew = max_t - min_t;
 
+            total_skew += skew;
+
+            if skew < (args.threshold * 1000i64) {
+                continue;
+            }
+
+            slow_launches += 1;
+            total_slow_skew += skew;
+
             println!(
-                "  occurrence #{idx}: skew {} ({} ranks)",
+                "  collective #{idx}: skew {} ({} ranks)",
                 format_duration(skew as i128),
                 ranks.len()
             );
-            for (r, start, end, demangled) in times {
+
+            for (r, start, end, _demangled) in times {
                 let label = rank_labels
                     .get(&r)
                     .cloned()
                     .unwrap_or_else(|| format!("globalPid {r}"));
+
                 println!(
-                    "    {label}: +{} from earliest, start={} ns, duration={} ({demangled})",
+                    "    {label}: +{} from earliest, start={} ns, duration={}",
                     format_duration((start - min_t) as i128),
                     start,
                     format_duration((end - start) as i128),
                 );
             }
         }
+
+        println!(
+            "Kernel {name}: {total_launches} collectives, ({slow_launches} > {}μs, {:.2}%), total skew {} (slow {})",
+            args.threshold,
+            (slow_launches as f64 / total_launches as f64 * 100.0),
+            format_duration(total_skew as i128),
+            format_duration(total_slow_skew as i128)
+        );
     }
 
     if !printed_any {
@@ -111,8 +151,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn open_connection(path: &str) -> Result<Connection> {
-    let p = Path::new(path);
+fn open_connection<P: AsRef<Path>>(path: P) -> Result<Connection> {
+    let p = path.as_ref();
     Connection::open_with_flags(p, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("opening SQLite DB at {}", p.display()))
 }
@@ -205,7 +245,7 @@ fn format_duration(ns: i128) -> String {
     } else if abs >= 1_000_000 {
         (ns as f64 / 1_000_000.0, "ms")
     } else if abs >= 1_000 {
-        (ns as f64 / 1_000.0, "us")
+        (ns as f64 / 1_000.0, "μs")
     } else {
         (ns as f64, "ns")
     };
